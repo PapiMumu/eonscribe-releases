@@ -1,17 +1,17 @@
 name: Release Download Guard
 
-# Live copy: installer releases are published here from PapiMumu/EonStream.
-# Keep the required filenames in sync with the `aliases` list in that repo's
-# .github/workflows/build-release.yml.
+# Installer releases are published to PapiMumu/eonscribe-releases. A copy of
+# this workflow must live there so it runs when those releases are published.
+# This copy only runs if a release is published on this source repository.
 #
-# Public download buttons link to fixed filenames under /releases/latest/download.
-# GitHub resolves /latest to the newest published, non-prerelease release, so
-# publishing a release that is missing one of those files silently breaks that
-# platform's download button for everyone.
+# Public download buttons link to fixed filenames under /releases/latest/download
+# on the distro repo. GitHub resolves /latest to the newest published,
+# non-prerelease release, so publishing a release that is missing one of those
+# files silently breaks that platform's download button for everyone.
 #
 # This runs the moment a release is published and reverts an incomplete one to
 # draft, which puts /latest back on the last complete release. Nothing is lost:
-# re-run the failed build job on EonStream, then publish again.
+# re-run the failed build job, then publish again.
 
 on:
   release:
@@ -37,10 +37,13 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
           RELEASE_ID: ${{ github.event.release.id }}
         run: |
+          # Keep in sync with the `aliases` list in build-release.yml and the
+          # download* URLs in web/app/_lib/site.ts.
           required=(
-            EonStream-windows-x64-setup.exe
-            EonStream-macos-arm64.dmg
-            EonStream-linux-x86_64.AppImage
+            EonScribe-windows-x64-setup.exe
+            EonScribe-macos-arm64.dmg
+            EonScribe-macos-x64.dmg
+            EonScribe-linux-x86_64.AppImage
           )
 
           # Never act on a failed lookup: an API hiccup would otherwise read as
@@ -65,13 +68,12 @@ jobs:
             exit 0
           fi
 
-          echo "::error::${TAG} is missing ${missing[*]}, which public download" \
-               "links point to. Reverting the release to draft so" \
+          echo "::error::${TAG} is missing ${missing[*]}, which the website's" \
+               "download buttons link to. Reverting the release to draft so" \
                "/releases/latest stays on the last complete release. To fix: open" \
-               "the 'Build, Bundle and Release' run on PapiMumu/EonStream for" \
-               "${TAG}, choose 'Re-run failed jobs' (not 'Re-run all jobs' — that" \
-               "discards the artifacts the other platforms already built), then" \
-               "publish again."
+               "the 'Build, Bundle and Release' run for ${TAG}, choose 'Re-run" \
+               "failed jobs' (not 'Re-run all jobs' — that discards the artifacts" \
+               "the other platforms already built), then publish again."
 
           gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=true > /dev/null
