@@ -1,0 +1,608 @@
+name: Build, Bundle and Release
+
+# This public repo runs the build because Actions on the private source repo
+# (PapiMumu/EonScribe) are failing at startup. The job checks out that private
+# source with SOURCE_REPO_TOKEN and publishes the draft release here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: EonScribe git ref to build
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASES_REPO: PapiMumu/eonscribe-releases
+  RELEASES_TARGET: main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    # Windows spent ~44 minutes building then died in post-cache at the 45
+    # minute cap (the installer had already uploaded). Linux whisper.cpp
+    # compile also needs headroom if it spills to swap.
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macOS Apple Silicon
+
+          # Last GitHub-hosted Intel image (available through ~Fall 2027).
+          # Native x86_64 so FFmpeg's build-ffmpeg-macos.sh matches the target.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macOS Intel
+
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: Linux x64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: Windows x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout EonScribe source
+        uses: actions/checkout@v5
+        with:
+          repository: PapiMumu/EonScribe
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Record source revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.21"
+
+      # Bounded on purpose. An apt mirror stalling here has twice eaten the
+      # whole 45-minute job budget before Rust ever compiled (v0.2.0 and
+      # v0.3.1), which marks the job cancelled and skips the release. Ten
+      # minutes is ~4x the normal duration; the connection timeouts turn a hung
+      # mirror into an error instead of a hang, and the retry rides out a single
+      # flaky mirror.
+      # AppImage + deb + a full Rust target can exhaust the ~14 GB root
+      # volume (v0.3.5 run #15: ENOSPC while bundling AppImage after deb/rpm).
+      # Drop unused toolchains before apt/cargo claim more space.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af || true
+          df -h /
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        # WebKit/GTK pulls are large; slow apt mirrors have hit the old 10m
+        # cap mid-install (v1.0.1). Twenty minutes leaves headroom without
+        # letting a hung mirror eat the whole job budget.
+        timeout-minutes: 20
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          APT_OPTS: >-
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+        run: |
+          sudo apt-get update $APT_OPTS || {
+            echo "::warning::apt-get update failed, retrying once"
+            sleep 5
+            sudo apt-get update $APT_OPTS
+          }
+
+          sudo apt-get install -y $APT_OPTS \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libasound2-dev \
+            libudev-dev \
+            patchelf
+          sudo apt-get clean
+          df -h /
+
+      # GitHub-hosted Linux is ~7 GB RAM. whisper.cpp + rustc in parallel
+      # OOMs the runner (no logs, step stuck "in progress"). 4G swap plus a
+      # job cap keeps the compile alive without filling the disk (8G did).
+      - name: Add swap and cap compile jobs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 4G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=2" >> "$GITHUB_ENV"
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri
+          # Caching target/ on Windows is multi-GB and was still compressing
+          # when the 45-minute job budget ran out. Registry cache is enough.
+          cache-targets: false
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # FFmpeg's x86 configure requires nasm for hand-optimized asm. Apple
+      # Silicon runners do not need it; macos-15-intel does not ship it.
+      - name: Install nasm for Intel macOS FFmpeg
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: brew install nasm
+
+      # Same toolchain as `bun run tauri:dev:cef` / docs/cef-browser.md.
+      - name: Install CEF build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja cmake
+
+      - name: Download CEF framework (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bun run download:cef
+          echo "CEF_PATH=${GITHUB_WORKSPACE}/vendor/cef" >> "$GITHUB_ENV"
+
+      - name: Build LGPL FFmpeg tools for macOS
+        if: runner.os == 'macOS'
+        run: bash data/build-ffmpeg-macos.sh
+
+      - name: Prepare application assets
+        run: bun run setup:bundle
+
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "EonScribe version: $VERSION"
+
+      - name: Pre-build Rust (workaround for whisper-rs-sys env issue)
+        shell: bash
+        working-directory: src-tauri
+        env:
+          ORT_DYLIB_PATH: ${{ matrix.target == 'x86_64-apple-darwin' && format('{0}/third-party/onnxruntime/macos-x64/libonnxruntime.dylib', github.workspace) || '' }}
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo build --release --target ${{ matrix.target }} --features cef-browser
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Build Tauri application
+        uses: tauri-apps/tauri-action@v0
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          # Intel Mac uses ort load-dynamic against the vendored dylib.
+          ORT_DYLIB_PATH: ${{ matrix.target == 'x86_64-apple-darwin' && format('{0}/third-party/onnxruntime/macos-x64/libonnxruntime.dylib', github.workspace) || '' }}
+
+          # Tauri build only — release creation happens in the release job.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # macOS signing (optional)
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+          # Auto-updater signing (optional)
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+        with:
+          # Linux: skip rpm — download buttons only need AppImage; bundling
+          # three formats back-to-back tipped the runner into ENOSPC.
+          # macOS: cef-browser matches local `bun run tauri:build:cef`.
+          # Skip Tauri ad-hoc codesign on macOS — Intel fails when signing
+          # EonScribe before the nested eonscribe_cef_helper. We ad-hoc sign
+          # after CEF inject in "Bundle CEF into macOS app and rebuild DMG".
+          args: >-
+            --target ${{ matrix.target }}
+            ${{ contains(matrix.target, 'apple-darwin') && '--features cef-browser' || '' }}
+            ${{ contains(matrix.target, 'apple-darwin') && '--config src-tauri/tauri.ci-macos-nosign.conf.json' || '' }}
+            ${{ matrix.target == 'x86_64-apple-darwin' && '--config src-tauri/tauri.macos-x64.conf.json' || '' }}
+            ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '--bundles deb,appimage' || '' }}
+
+      # Inject Chromium Embedded Framework + helper, then rebuild the DMG so
+      # the published installer actually contains CEF (Tauri's DMG was built
+      # before this step).
+      - name: Bundle CEF into macOS app and rebuild DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" \
+            -maxdepth 1 -name "*.app" | head -1)
+          if [[ -z "$APP" ]]; then
+            echo "::error::No .app found under bundle/macos to inject CEF"
+            exit 1
+          fi
+          APP="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
+          bash scripts/bundle-cef-macos.sh "$APP"
+
+          VERSION="${{ steps.version.outputs.version }}"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
+          DMG=$(find "$BUNDLE_DIR" -type f -name "*.dmg" | head -1)
+          if [[ -z "$DMG" ]]; then
+            case "${{ matrix.target }}" in
+              aarch64-apple-darwin) ARCH_SUFFIX="aarch64" ;;
+              x86_64-apple-darwin) ARCH_SUFFIX="x64" ;;
+              *) ARCH_SUFFIX="${{ matrix.target }}" ;;
+            esac
+            mkdir -p "$BUNDLE_DIR/dmg"
+            DMG="$BUNDLE_DIR/dmg/EonScribe_${VERSION}_${ARCH_SUFFIX}.dmg"
+          fi
+          rm -f "$DMG"
+          hdiutil create \
+            -volname "EonScribe ${VERSION}" \
+            -srcfolder "$APP" \
+            -ov -format UDZO \
+            "$DMG"
+          echo "Rebuilt DMG with CEF: $DMG"
+
+          APP_TGZ=$(find "$BUNDLE_DIR" -type f -name "*.app.tar.gz" | head -1)
+          if [[ -n "$APP_TGZ" ]]; then
+            APP_TGZ="$(cd "$(dirname "$APP_TGZ")" && pwd)/$(basename "$APP_TGZ")"
+            TMP=$(mktemp -d)
+            cp -R "$APP" "$TMP/"
+            (
+              cd "$TMP"
+              tar -czf "$APP_TGZ" "$(basename "$APP")"
+            )
+            rm -rf "$TMP"
+            echo "Rebuilt app.tar.gz with CEF: $APP_TGZ"
+          fi
+
+      # ---------------------------------------------------------------
+      # Collect the distributable files produced by Tauri.
+      # ---------------------------------------------------------------
+
+      - name: Collect macOS artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          find "src-tauri/target/${{ matrix.target }}/release/bundle" \
+            -type f \
+            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
+            -exec cp {} dist/ \;
+
+      - name: Collect Linux artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          find "src-tauri/target/${{ matrix.target }}/release/bundle" \
+            -type f \
+            \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) \
+            -exec cp {} dist/ \;
+
+      - name: Collect Windows artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          Get-ChildItem `
+            -Path "src-tauri\target\${{ matrix.target }}\release\bundle" `
+            -Recurse `
+            -File |
+            Where-Object {
+              $_.Extension -in ".exe", ".msi"
+            } |
+            Copy-Item -Destination dist
+
+      - name: List collected artifacts
+        shell: bash
+        run: |
+          echo "Collected artifacts:"
+          ls -lh dist
+
+      # ---------------------------------------------------------------
+      # Calculate SHA-256 and file sizes.
+      # ---------------------------------------------------------------
+
+      - name: Generate artifact metadata
+        shell: bash
+        run: |
+          echo "${{ steps.version.outputs.version }}" > dist/version.txt
+
+          echo "# ${{ matrix.platform }}" > dist/checksums.txt
+          echo "" >> dist/checksums.txt
+
+          echo "# ${{ matrix.platform }}" > dist/sizes.txt
+          echo "" >> dist/sizes.txt
+
+          for file in dist/*; do
+            if [[ -f "$file" ]] &&
+               [[ "$file" != "dist/version.txt" ]] &&
+               [[ "$file" != "dist/checksums.txt" ]] &&
+               [[ "$file" != "dist/sizes.txt" ]]; then
+
+              filename=$(basename "$file")
+
+              if command -v sha256sum >/dev/null 2>&1; then
+                sha256=$(sha256sum "$file" | awk '{print $1}')
+              else
+                sha256=$(shasum -a 256 "$file" | awk '{print $1}')
+              fi
+
+              if command -v stat >/dev/null 2>&1; then
+                if [[ "$RUNNER_OS" == "macOS" ]]; then
+                  size_bytes=$(stat -f "%z" "$file")
+                else
+                  size_bytes=$(stat -c "%s" "$file")
+                fi
+              fi
+
+              size_mb=$(awk "BEGIN {printf \"%.2f\", $size_bytes / 1024 / 1024}")
+
+              echo "$sha256  $filename" >> dist/checksums.txt
+              echo "$filename|$size_mb MB|$sha256" >> dist/sizes.txt
+            fi
+          done
+
+          echo ""
+          echo "Checksums:"
+          cat dist/checksums.txt
+
+          echo ""
+          echo "Sizes:"
+          cat dist/sizes.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eonscribe-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # =====================================================================
+  # RELEASE
+  # =====================================================================
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    # Assemble a release from whatever platforms did build. `needs: build` alone
+    # skipped this job whenever one matrix leg failed or timed out, so a single
+    # stalled apt mirror threw away two good platform builds (v0.2.0, v0.3.1).
+    # The release is a draft and the notes list any missing platform, so a human
+    # decides whether to publish or re-run. `!cancelled()` still respects a
+    # manual cancel of the whole run.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: eonscribe-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Inspect downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find artifacts -type f -maxdepth 3 -print
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(find artifacts -name version.txt -type f | head -1 | xargs cat)
+
+          if [[ -z "$VERSION" ]]; then
+            echo "Could not determine EonScribe version."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "EonScribe version: $VERSION"
+
+      - name: Prepare release assets
+        id: assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+
+          find artifacts \
+            -type f \
+            \( \
+              -name "*.dmg" \
+              -o -name "*.AppImage" \
+              -o -name "*.deb" \
+              -o -name "*.rpm" \
+              -o -name "*.exe" \
+              -o -name "*.msi" \
+              -o -name "*.tar.gz" \
+              -o -name "*.sig" \
+            \) \
+            -exec cp {} release-assets/ \;
+
+          # Public download buttons link to fixed filenames under
+          # /releases/latest/download on RELEASES_REPO. Tauri stamps the
+          # version into every bundle name, so ship stable-named copies
+          # alongside the versioned ones — otherwise those links 404.
+          aliases=(
+            "*_x64-setup.exe:EonScribe-windows-x64-setup.exe"
+            "*_aarch64.dmg:EonScribe-macos-arm64.dmg"
+            "*_x64.dmg:EonScribe-macos-x64.dmg"
+            "*_amd64.AppImage:EonScribe-linux-x86_64.AppImage"
+          )
+
+          missing=()
+          for entry in "${aliases[@]}"; do
+            pattern="${entry%%:*}"
+            alias_name="${entry##*:}"
+            match=$(find release-assets -maxdepth 1 -name "$pattern" | head -1)
+
+            if [[ -n "$match" ]]; then
+              cp "$match" "release-assets/$alias_name"
+              echo "Stable alias: $alias_name -> $(basename "$match")"
+            else
+              missing+=("$alias_name")
+            fi
+          done
+
+          # Record rather than fail: the release is a draft, and half a release
+          # beats none when one platform's build stalls. The notes carry the
+          # warning so nobody publishes a 404-ing download button by accident.
+          # Re-running the failed build and this job fills the gap in place
+          # (overwrite_files is on).
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::warning::Missing artifacts, no stable alias for: ${missing[*]}." \
+                 "The site's download buttons link to those filenames. Use 'Re-run" \
+                 "failed jobs' on this run before publishing — not 'Re-run all" \
+                 "jobs', which deletes the artifacts the other platforms produced." \
+                 "Artifacts are kept for 7 days; after that, re-tag instead."
+          fi
+          echo "missing=${missing[*]}" >> "$GITHUB_OUTPUT"
+
+          echo "Release assets:"
+          ls -lh release-assets
+
+      - name: Generate release metadata
+        id: metadata
+        shell: bash
+        env:
+          MISSING_ALIASES: ${{ steps.assets.outputs.missing }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          RELEASE_NAME="EonScribe v${VERSION}"
+          SUMMARY="Desktop release build for macOS, Linux, and Windows."
+
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## ${RELEASE_NAME}"
+            echo ""
+            echo "${SUMMARY}"
+            echo ""
+
+            # Loud, in the draft, where the person clicking Publish will see it.
+            if [[ -n "${MISSING_ALIASES}" ]]; then
+              echo "> [!WARNING]"
+              echo "> Platform builds missing from this release:" \
+                   "\`${MISSING_ALIASES}\`."
+              echo "> The website's download buttons link to those filenames and"
+              echo "> will 404. Before publishing, use **Re-run failed jobs** on"
+              echo "> this run — it rebuilds only the failed platform, keeps the"
+              echo "> artifacts the others already produced, and re-runs this"
+              echo "> release job to add the missing files to this same draft."
+              echo "> Do not use *Re-run all jobs*: that deletes the existing"
+              echo "> artifacts and rebuilds every platform from scratch."
+              echo ""
+            fi
+
+            echo "**Source:** [\`PapiMumu/EonScribe@${SOURCE_SHA:0:7}\`](https://github.com/PapiMumu/EonScribe/commit/${SOURCE_SHA})"
+            echo ""
+            echo "### Downloads"
+            echo ""
+            echo "| Platform | File | Size | SHA-256 |"
+            echo "|---|---|---:|---|"
+
+            for metadata in artifacts/*/sizes.txt; do
+              platform=$(head -1 "$metadata" | sed 's/^# //')
+
+              tail -n +3 "$metadata" | while IFS='|' read -r filename size sha256; do
+                if [[ -n "$filename" ]]; then
+                  echo "| $platform | \`$filename\` | $size | \`$sha256\` |"
+                fi
+              done
+            done
+
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo "Download the installer for your platform from the assets below."
+            echo ""
+            echo "The installer is currently **unsigned**, so your operating system may display a security warning on first launch."
+            echo ""
+            echo "### Included"
+            echo ""
+            echo "- Bible database"
+            echo "- Bible verse detection"
+            echo "- Desktop application"
+            echo "- macOS CEF (Chromium) program web for Audience / Stage"
+
+          } > release-notes.md
+
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.RELEASES_REPO }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ steps.version.outputs.version }}
+          name: ${{ steps.metadata.outputs.release_name }}
+          body_path: release-notes.md
+          draft: true
+          prerelease: false
+          files: release-assets/*
+          overwrite_files: true
+          # The public repo does not contain this source tree. Tag the empty
+          # `main` commit there so GitHub can attach installer assets.
+          target_commitish: ${{ env.RELEASES_TARGET }}
+
+      # GitHub's "get release by tag" API excludes drafts, so the action above
+      # cannot find the draft a previous attempt created: it takes the "create"
+      # path, hits already-exists, uploads the new assets, and leaves the old
+      # body in place. On v0.3.1 that stranded a "Linux build missing" warning
+      # on a release that had just been completed by a re-run. Setting the body
+      # explicitly makes the notes describe the attempt that actually produced
+      # them. `gh` finds drafts by tag, which the action's lookup does not.
+      - name: Sync release notes to this attempt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --repo is required: this job never checks out the repo (it only
+          # downloads artifacts), so gh has no git remote to infer from and
+          # fails with "not a git repository".
+          gh release edit "v${{ steps.version.outputs.version }}" \
+            --repo "${RELEASES_REPO}" \
+            --notes-file release-notes.md
+
+          echo "Release notes synced for v${{ steps.version.outputs.version }} on ${RELEASES_REPO}."
